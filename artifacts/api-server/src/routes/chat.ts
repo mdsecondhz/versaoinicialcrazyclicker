@@ -49,9 +49,18 @@ router.post("/chat/message", async (req: any, res) => {
 
     const reply = completion.choices[0]?.message?.content ?? "O oráculo está em silêncio...";
     return res.json({ reply });
-  } catch (err) {
+  } catch (err: any) {
     req.log.error(err, "Chatbot error");
-    return res.status(500).json({ error: "Erro interno do servidor" });
+
+    // Return specific, user-friendly error codes so the frontend can show helpful messages
+    if (err?.status === 429 || err?.code === "insufficient_quota") {
+      return res.status(402).json({ error: "quota_exceeded" });
+    }
+    if (err?.status === 401) {
+      return res.status(401).json({ error: "invalid_key" });
+    }
+
+    return res.status(500).json({ error: "server_error" });
   }
 });
 

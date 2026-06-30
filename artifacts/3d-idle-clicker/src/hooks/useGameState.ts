@@ -1,5 +1,4 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { useUser } from "@clerk/react";
 
 export interface Upgrade {
   id: string;
@@ -39,16 +38,17 @@ const INITIAL_STATE: GameState = {
   lastSaved: Date.now()
 };
 
-const SAVE_KEY = "crystal_forge_save";
+const SAVE_KEY = "crazy_clicker_save";
 
-export function useGameState() {
+// isSignedIn is passed as a parameter so useUser() stays in the component tree
+// where ClerkProvider is guaranteed to be mounted — avoids hooks-order violations.
+export function useGameState(isSignedIn: boolean = false) {
   const [state, setState] = useState<GameState>(INITIAL_STATE);
   const [isSaving, setIsSaving] = useState(false);
   const [isCloudSyncing, setIsCloudSyncing] = useState(false);
-  const { user, isSignedIn } = useUser();
   const initRef = useRef(false);
 
-  // Load from local or cloud
+  // Load from local or cloud on mount / sign-in change
   useEffect(() => {
     const loadState = async () => {
       let localState: GameState | null = null;
@@ -56,46 +56,34 @@ export function useGameState() {
 
       try {
         const saved = localStorage.getItem(SAVE_KEY);
-        if (saved) {
-          localState = JSON.parse(saved);
-        }
-      } catch (e) {
-        console.error("Failed to load local save", e);
+        if (saved) localState = JSON.parse(saved);
+      } catch {
+        // ignore
       }
 
       if (isSignedIn) {
         try {
           const res = await fetch("/api/game/save");
-          if (res.ok) {
-            cloudState = await res.json();
-          }
-        } catch (e) {
-          console.error("Failed to load cloud save", e);
+          if (res.ok) cloudState = await res.json();
+        } catch {
+          // ignore
         }
       }
 
+      // Prefer cloud state if it has more energy
       let bestState = localState;
-      
-      // Use cloud state if it has more energy, or if no local state
-      if (cloudState && (!localState || cloudState.energy > localState.energy)) {
-        const cloudUpgradesObj = cloudState.upgradeCounts || {};
-        
-        // Rebuild upgrades
+      if (cloudState && (!localState || cloudState.energy > (localState?.energy ?? 0))) {
+        const cloudUpgradesObj: Record<string, number> = cloudState.upgradeCounts ?? {};
         let newEnergyPerClick = 1;
         let newEnergyPerSecond = 0;
-        
         const mergedUpgrades = UPGRADES.map(baseUp => {
-          const count = cloudUpgradesObj[baseUp.id] || 0;
-          if (baseUp.effectType === "click") {
-            newEnergyPerClick += baseUp.effectValue * count;
-          } else {
-            newEnergyPerSecond += baseUp.effectValue * count;
-          }
+          const count = cloudUpgradesObj[baseUp.id] ?? 0;
+          if (baseUp.effectType === "click") newEnergyPerClick += baseUp.effectValue * count;
+          else newEnergyPerSecond += baseUp.effectValue * count;
           return { ...baseUp, count };
         });
-
         bestState = {
-          energy: cloudState.energy || 0,
+          energy: cloudState.energy ?? 0,
           energyPerClick: newEnergyPerClick,
           energyPerSecond: newEnergyPerSecond,
           upgrades: mergedUpgrades,
@@ -104,22 +92,16 @@ export function useGameState() {
       }
 
       if (bestState) {
-        // Just in case it's a local state without derived stats
         const mergedUpgrades = UPGRADES.map(baseUp => {
-          const savedUp = bestState!.upgrades?.find((u: any) => u.id === baseUp.id);
+          const savedUp = (bestState!.upgrades ?? []).find((u: any) => u.id === baseUp.id);
           return savedUp ? { ...baseUp, count: savedUp.count } : baseUp;
         });
-
         let newEnergyPerClick = 1;
         let newEnergyPerSecond = 0;
         mergedUpgrades.forEach(u => {
-          if (u.effectType === "click") {
-            newEnergyPerClick += u.effectValue * u.count;
-          } else {
-            newEnergyPerSecond += u.effectValue * u.count;
-          }
+          if (u.effectType === "click") newEnergyPerClick += u.effectValue * u.count;
+          else newEnergyPerSecond += u.effectValue * u.count;
         });
-
         setState({
           ...INITIAL_STATE,
           ...bestState,
@@ -128,34 +110,26 @@ export function useGameState() {
           energyPerSecond: newEnergyPerSecond
         });
       }
+
       initRef.current = true;
     };
 
     loadState();
-  }, [isSignedIn]); // Reload when sign in state changes
+  }, [isSignedIn]);
 
   const saveStateLocal = useCallback((currentState: GameState) => {
     setIsSaving(true);
     try {
-      localStorage.setItem(SAVE_KEY, JSON.stringify({
-        ...currentState,
-        lastSaved: Date.now()
-      }));
-    } catch (e) {
-      console.error("Failed to save", e);
-    }
+      localStorage.setItem(SAVE_KEY, JSON.stringify({ ...currentState, lastSaved: Date.now() }));
+    } catch { /* ignore */ }
     setTimeout(() => setIsSaving(false), 500);
   }, []);
 
   const saveStateCloud = useCallback(async (currentState: GameState) => {
     if (!isSignedIn) return;
     setIsCloudSyncing(true);
-    
     const upgradeCounts: Record<string, number> = {};
-    currentState.upgrades.forEach(u => {
-      if (u.count > 0) upgradeCounts[u.id] = u.count;
-    });
-
+    currentState.upgrades.forEach(u => { if (u.count > 0) upgradeCounts[u.id] = u.count; });
     try {
       await fetch("/api/game/save", {
         method: "PUT",
@@ -167,115 +141,76 @@ export function useGameState() {
           upgradeCounts
         })
       });
-    } catch (e) {
-      console.error("Failed to save to cloud", e);
-    }
+    } catch { /* ignore */ }
     setTimeout(() => setIsCloudSyncing(false), 1000);
   }, [isSignedIn]);
 
-  // Save every 5 seconds locally
+  // Local save every 5 seconds
   useEffect(() => {
-    if (!initRef.current) return;
-    const interval = setInterval(() => {
-      saveStateLocal(state);
-    }, 5000);
+    const interval = setInterval(() => saveStateLocal(state), 5000);
     return () => clearInterval(interval);
   }, [state, saveStateLocal]);
 
-  // Save every 15 seconds to cloud
+  // Cloud save every 15 seconds
   useEffect(() => {
-    if (!initRef.current || !isSignedIn) return;
-    const interval = setInterval(() => {
-      saveStateCloud(state);
-    }, 15000);
+    if (!isSignedIn) return;
+    const interval = setInterval(() => saveStateCloud(state), 15000);
     return () => clearInterval(interval);
   }, [state, saveStateCloud, isSignedIn]);
 
-  // Save on beforeunload
+  // Save on tab close
   useEffect(() => {
     const handleBeforeUnload = () => {
       saveStateLocal(state);
       if (isSignedIn) {
-        // Send beacon for cloud save since fetch might not complete
         const upgradeCounts: Record<string, number> = {};
-        state.upgrades.forEach(u => {
-          if (u.count > 0) upgradeCounts[u.id] = u.count;
-        });
-        const blob = new Blob([JSON.stringify({
+        state.upgrades.forEach(u => { if (u.count > 0) upgradeCounts[u.id] = u.count; });
+        navigator.sendBeacon("/api/game/save", new Blob([JSON.stringify({
           energy: state.energy,
           energyPerClick: state.energyPerClick,
           energyPerSecond: state.energyPerSecond,
           upgradeCounts
-        })], { type: 'application/json' });
-        navigator.sendBeacon("/api/game/save", blob);
+        })], { type: "application/json" }));
       }
     };
     window.addEventListener("beforeunload", handleBeforeUnload);
     return () => window.removeEventListener("beforeunload", handleBeforeUnload);
   }, [state, saveStateLocal, isSignedIn]);
 
-  // Passive income tick (every 1 second)
+  // Passive income
   useEffect(() => {
     if (state.energyPerSecond === 0) return;
-    
     const interval = setInterval(() => {
-      setState(prev => ({
-        ...prev,
-        energy: prev.energy + prev.energyPerSecond
-      }));
+      setState(prev => ({ ...prev, energy: prev.energy + prev.energyPerSecond }));
     }, 1000);
     return () => clearInterval(interval);
   }, [state.energyPerSecond]);
 
   const clickCrystal = useCallback(() => {
-    setState(prev => ({
-      ...prev,
-      energy: prev.energy + prev.energyPerClick
-    }));
+    setState(prev => ({ ...prev, energy: prev.energy + prev.energyPerClick }));
   }, []);
 
-  const getUpgradeCost = (upgrade: Upgrade) => {
-    return Math.floor(upgrade.baseCost * Math.pow(upgrade.costMultiplier, upgrade.count));
-  };
+  const getUpgradeCost = (upgrade: Upgrade) =>
+    Math.floor(upgrade.baseCost * Math.pow(upgrade.costMultiplier, upgrade.count));
 
   const buyUpgrade = useCallback((upgradeId: string) => {
     setState(prev => {
       const upgradeIndex = prev.upgrades.findIndex(u => u.id === upgradeId);
       if (upgradeIndex === -1) return prev;
-      
       const upgrade = prev.upgrades[upgradeIndex];
       const cost = getUpgradeCost(upgrade);
-      
       if (prev.energy < cost) return prev;
-      
       const newUpgrades = [...prev.upgrades];
       newUpgrades[upgradeIndex] = { ...upgrade, count: upgrade.count + 1 };
-      
-      let newEnergyPerClick = prev.energyPerClick;
-      let newEnergyPerSecond = prev.energyPerSecond;
-      
-      if (upgrade.effectType === "click") {
-        newEnergyPerClick += upgrade.effectValue;
-      } else {
-        newEnergyPerSecond += upgrade.effectValue;
-      }
-      
       return {
         ...prev,
         energy: prev.energy - cost,
         upgrades: newUpgrades,
-        energyPerClick: newEnergyPerClick,
-        energyPerSecond: newEnergyPerSecond
+        energyPerClick: upgrade.effectType === "click" ? prev.energyPerClick + upgrade.effectValue : prev.energyPerClick,
+        energyPerSecond: upgrade.effectType === "passive" ? prev.energyPerSecond + upgrade.effectValue : prev.energyPerSecond,
       };
     });
   }, []);
 
-  return {
-    state,
-    clickCrystal,
-    buyUpgrade,
-    getUpgradeCost,
-    isSaving,
-    isCloudSyncing
-  };
+  return { state, clickCrystal, buyUpgrade, getUpgradeCost, isSaving, isCloudSyncing };
 }

@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { ClerkProvider, SignIn, SignUp, Show, useClerk, useUser } from '@clerk/react';
+import { ClerkProvider, SignIn, SignUp, useClerk, useUser } from '@clerk/react';
 import { publishableKeyFromHost } from '@clerk/react/internal';
 import { shadcn } from '@clerk/themes';
 import { Switch, Route, useLocation, Router as WouterRouter } from 'wouter';
@@ -123,7 +123,8 @@ function SignUpPage() {
 }
 
 function Game() {
-  const { state, clickCrystal, buyUpgrade, getUpgradeCost, isSaving, isCloudSyncing } = useGameState();
+  const { isSignedIn } = useUser();
+  const { state, clickCrystal, buyUpgrade, getUpgradeCost, isSaving, isCloudSyncing } = useGameState(isSignedIn ?? false);
   const { popups, addPopup } = useClickEffect();
 
   // Force dark mode
