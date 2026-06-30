@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { useUser } from "@clerk/react";
 
 export interface Upgrade {
   id: string;
@@ -43,30 +44,97 @@ const SAVE_KEY = "crystal_forge_save";
 export function useGameState() {
   const [state, setState] = useState<GameState>(INITIAL_STATE);
   const [isSaving, setIsSaving] = useState(false);
+  const [isCloudSyncing, setIsCloudSyncing] = useState(false);
+  const { user, isSignedIn } = useUser();
+  const initRef = useRef(false);
 
-  // Load from localStorage
+  // Load from local or cloud
   useEffect(() => {
-    try {
-      const saved = localStorage.getItem(SAVE_KEY);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        // Merge saved upgrades with base upgrades to handle additions/changes
+    const loadState = async () => {
+      let localState: GameState | null = null;
+      let cloudState: any = null;
+
+      try {
+        const saved = localStorage.getItem(SAVE_KEY);
+        if (saved) {
+          localState = JSON.parse(saved);
+        }
+      } catch (e) {
+        console.error("Failed to load local save", e);
+      }
+
+      if (isSignedIn) {
+        try {
+          const res = await fetch("/api/game/save");
+          if (res.ok) {
+            cloudState = await res.json();
+          }
+        } catch (e) {
+          console.error("Failed to load cloud save", e);
+        }
+      }
+
+      let bestState = localState;
+      
+      // Use cloud state if it has more energy, or if no local state
+      if (cloudState && (!localState || cloudState.energy > localState.energy)) {
+        const cloudUpgradesObj = cloudState.upgradeCounts || {};
+        
+        // Rebuild upgrades
+        let newEnergyPerClick = 1;
+        let newEnergyPerSecond = 0;
+        
         const mergedUpgrades = UPGRADES.map(baseUp => {
-          const savedUp = parsed.upgrades?.find((u: any) => u.id === baseUp.id);
+          const count = cloudUpgradesObj[baseUp.id] || 0;
+          if (baseUp.effectType === "click") {
+            newEnergyPerClick += baseUp.effectValue * count;
+          } else {
+            newEnergyPerSecond += baseUp.effectValue * count;
+          }
+          return { ...baseUp, count };
+        });
+
+        bestState = {
+          energy: cloudState.energy || 0,
+          energyPerClick: newEnergyPerClick,
+          energyPerSecond: newEnergyPerSecond,
+          upgrades: mergedUpgrades,
+          lastSaved: Date.now()
+        };
+      }
+
+      if (bestState) {
+        // Just in case it's a local state without derived stats
+        const mergedUpgrades = UPGRADES.map(baseUp => {
+          const savedUp = bestState!.upgrades?.find((u: any) => u.id === baseUp.id);
           return savedUp ? { ...baseUp, count: savedUp.count } : baseUp;
         });
+
+        let newEnergyPerClick = 1;
+        let newEnergyPerSecond = 0;
+        mergedUpgrades.forEach(u => {
+          if (u.effectType === "click") {
+            newEnergyPerClick += u.effectValue * u.count;
+          } else {
+            newEnergyPerSecond += u.effectValue * u.count;
+          }
+        });
+
         setState({
           ...INITIAL_STATE,
-          ...parsed,
-          upgrades: mergedUpgrades
+          ...bestState,
+          upgrades: mergedUpgrades,
+          energyPerClick: newEnergyPerClick,
+          energyPerSecond: newEnergyPerSecond
         });
       }
-    } catch (e) {
-      console.error("Failed to load save", e);
-    }
-  }, []);
+      initRef.current = true;
+    };
 
-  const saveState = useCallback((currentState: GameState) => {
+    loadState();
+  }, [isSignedIn]); // Reload when sign in state changes
+
+  const saveStateLocal = useCallback((currentState: GameState) => {
     setIsSaving(true);
     try {
       localStorage.setItem(SAVE_KEY, JSON.stringify({
@@ -79,20 +147,72 @@ export function useGameState() {
     setTimeout(() => setIsSaving(false), 500);
   }, []);
 
-  // Save every 5 seconds
+  const saveStateCloud = useCallback(async (currentState: GameState) => {
+    if (!isSignedIn) return;
+    setIsCloudSyncing(true);
+    
+    const upgradeCounts: Record<string, number> = {};
+    currentState.upgrades.forEach(u => {
+      if (u.count > 0) upgradeCounts[u.id] = u.count;
+    });
+
+    try {
+      await fetch("/api/game/save", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          energy: currentState.energy,
+          energyPerClick: currentState.energyPerClick,
+          energyPerSecond: currentState.energyPerSecond,
+          upgradeCounts
+        })
+      });
+    } catch (e) {
+      console.error("Failed to save to cloud", e);
+    }
+    setTimeout(() => setIsCloudSyncing(false), 1000);
+  }, [isSignedIn]);
+
+  // Save every 5 seconds locally
   useEffect(() => {
+    if (!initRef.current) return;
     const interval = setInterval(() => {
-      saveState(state);
+      saveStateLocal(state);
     }, 5000);
     return () => clearInterval(interval);
-  }, [state, saveState]);
+  }, [state, saveStateLocal]);
+
+  // Save every 15 seconds to cloud
+  useEffect(() => {
+    if (!initRef.current || !isSignedIn) return;
+    const interval = setInterval(() => {
+      saveStateCloud(state);
+    }, 15000);
+    return () => clearInterval(interval);
+  }, [state, saveStateCloud, isSignedIn]);
 
   // Save on beforeunload
   useEffect(() => {
-    const handleBeforeUnload = () => saveState(state);
+    const handleBeforeUnload = () => {
+      saveStateLocal(state);
+      if (isSignedIn) {
+        // Send beacon for cloud save since fetch might not complete
+        const upgradeCounts: Record<string, number> = {};
+        state.upgrades.forEach(u => {
+          if (u.count > 0) upgradeCounts[u.id] = u.count;
+        });
+        const blob = new Blob([JSON.stringify({
+          energy: state.energy,
+          energyPerClick: state.energyPerClick,
+          energyPerSecond: state.energyPerSecond,
+          upgradeCounts
+        })], { type: 'application/json' });
+        navigator.sendBeacon("/api/game/save", blob);
+      }
+    };
     window.addEventListener("beforeunload", handleBeforeUnload);
     return () => window.removeEventListener("beforeunload", handleBeforeUnload);
-  }, [state, saveState]);
+  }, [state, saveStateLocal, isSignedIn]);
 
   // Passive income tick (every 1 second)
   useEffect(() => {
@@ -155,6 +275,7 @@ export function useGameState() {
     clickCrystal,
     buyUpgrade,
     getUpgradeCost,
-    isSaving
+    isSaving,
+    isCloudSyncing
   };
 }
